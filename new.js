@@ -1,14 +1,14 @@
 /**
- * SCRIPT HOÀN THÀNH VIDEO COURSERA v5.1 (Tích hợp Dual API Call)
+ * SCRIPT HOÀN THÀNH VIDEO COURSERA v5.3 (Enhanced Logic & Delay)
  * Tác giả: Dựa trên nghiên cứu của cộng đồng.
  * Ngày cập nhật: 21/10/2025
  *
  * TÍNH NĂNG:
  * - Sử dụng API onDemandVideoProgresses.v1 để cập nhật tiến độ video (chính).
  * - Gửi thêm yêu cầu 'ended' qua API opencourse.v1 để tăng tính tương thích (phụ).
- * - Tự động tìm videoId bằng 2 phương pháp:
- * 1. API Course Materials (nhanh, cho các video thông thường).
- * 2. API Lecture Videos (dự phòng, cho các video đặc biệt hoặc bài tập có video).
+ * - Tăng độ trễ giữa các lệnh gọi API lên 2 giây để đảm bảo server đồng bộ.
+ * - Logic tìm kiếm thông minh hơn: luôn ưu tiên lấy thời lượng video chính xác nhất.
+ * - Tự động tìm videoId bằng 2 phương pháp (chính và dự phòng).
  * - Tự động lấy tất cả thông tin cần thiết (userId, courseId, lectureId).
  * - Cung cấp log chi tiết trên Console để dễ dàng theo dõi.
  *
@@ -68,72 +68,52 @@ async function getCourseId(slug) {
     return course.id;
 }
 
-// ===================== VIDEO INFO FINDERS (Primary & Fallback) =====================
+// ===================== VIDEO INFO FINDER (ENHANCED) =====================
 
-/**
- * [Cách 1] Lấy videoId từ API Course Materials.
- */
-async function _getVideoInfoFromMaterials(courseSlug, lectureId) {
-    const url = `https://www.coursera.org/api/onDemandCourseMaterials.v2/?q=slug&slug=${courseSlug}&includes=items&fields=onDemandCourseMaterialItems.v2(name,slug,contentSummary,assetSummary)`;
-    const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) throw new Error(`Lỗi API Materials: ${res.status}`);
-    const data = await res.json();
-    const items = data?.linked?.['onDemandCourseMaterialItems.v2'];
+async function getVideoInfo(courseSlug, lectureId, courseId) {
+    // Bước 1: Luôn truy vấn API Course Materials vì nó chứa nhiều metadata nhất (như duration).
+    console.log("-> Lấy thông tin chi tiết bài giảng từ Course Materials API...");
+    const materialsUrl = `https://www.coursera.org/api/onDemandCourseMaterials.v2/?q=slug&slug=${courseSlug}&includes=items&fields=onDemandCourseMaterialItems.v2(name,slug,contentSummary,assetSummary)`;
+    const materialsRes = await fetch(materialsUrl, { credentials: 'include' });
+    if (!materialsRes.ok) throw new Error(`Lỗi API Materials: ${materialsRes.status}`);
+    
+    const materialsData = await materialsRes.json();
+    const items = materialsData?.linked?.['onDemandCourseMaterialItems.v2'];
     if (!items) throw new Error("Không có dữ liệu bài học trong API Materials.");
-
+    
     const item = items.find(i => i.id === lectureId);
     if (!item) throw new Error(`Không tìm thấy item '${lectureId}' trong API Materials.`);
-    if (item.contentSummary?.typeName !== 'lecture') throw new Error("Item không phải là một bài giảng video.");
 
-    const def = item.assetSummary?.definition;
-    if (!def?.videoId) throw new Error("Item này không chứa videoId trong API Materials.");
+    // Bước 2: Lấy ra thời lượng chính xác nhất có thể. Nếu không có, dùng giá trị mặc định.
+    const duration = item?.assetSummary?.definition?.duration || 300000;
+    console.log(`   Tìm thấy thời lượng: ${duration}ms`);
 
-    return {
-        videoId: def.videoId,
-        duration: def.duration || 300000 // duration tính bằng mili-giây
-    };
-}
-
-/**
- * [Cách 2 - Fallback] Lấy videoId từ API Lecture Videos.
- */
-async function _getVideoInfoFromLectureApi(courseId, lectureId) {
-    const url = `https://www.coursera.org/api/onDemandLectureVideos.v1/${courseId}~${lectureId}?includes=video&fields=onDemandVideos.v1(id)`;
-    const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) throw new Error(`Lỗi API Lecture: ${res.status}`);
-    const data = await res.json();
-    const videoId = data?.linked?.['onDemandVideos.v1']?.[0]?.id;
-
-    if (!videoId) {
-        throw new Error("Không tìm thấy videoId trong API Lecture.");
+    // Bước 3: Thử lấy videoId từ nguồn chính (cách 1).
+    let videoId = item?.assetSummary?.definition?.videoId;
+    if (videoId) {
+        console.log("   Thành công lấy videoId bằng cách 1!");
+        return { videoId, duration };
     }
 
-    return {
-        videoId: videoId,
-        duration: 300000 // API này không trả về duration, ta dùng giá trị mặc định
-    };
-}
-
-/**
- * Hàm tổng hợp: Thử cách 1, nếu thất bại thì thử cách 2.
- */
-async function getVideoInfo_V5(courseSlug, lectureId, courseId) {
+    // Bước 4: Nếu cách 1 thất bại, dùng cách 2 (dự phòng) để lấy videoId, nhưng vẫn giữ lại duration đã tìm được.
+    console.warn("   Không tìm thấy videoId trong Course Materials. Thử cách 2 (Fallback)...");
     try {
-        console.log("-> Thử cách 1: Lấy thông tin từ Course Materials API...");
-        const videoInfo = await _getVideoInfoFromMaterials(courseSlug, lectureId);
-        console.log("   Thành công bằng cách 1!");
-        return videoInfo;
-    } catch (error) {
-        console.warn(`   Cách 1 thất bại: ${error.message}`);
-        console.log("-> Thử cách 2 (Fallback): Lấy thông tin từ Lecture Videos API...");
-        try {
-            const videoInfo = await _getVideoInfoFromLectureApi(courseId, lectureId);
-            console.log("   Thành công bằng cách 2!");
-            return videoInfo;
-        } catch (fallbackError) {
-             console.error(`   Cách 2 cũng thất bại: ${fallbackError.message}`);
-             throw new Error("Không thể tìm thấy videoId bằng cả hai cách. Đây có thể là bài đọc thuần túy hoặc quiz.");
+        const lectureUrl = `https://www.coursera.org/api/onDemandLectureVideos.v1/${courseId}~${lectureId}?includes=video&fields=onDemandVideos.v1(id)`;
+        const lectureRes = await fetch(lectureUrl, { credentials: 'include' });
+        if (!lectureRes.ok) throw new Error(`Lỗi API Lecture: ${lectureRes.status}`);
+        
+        const lectureData = await lectureRes.json();
+        videoId = lectureData?.linked?.['onDemandVideos.v1']?.[0]?.id;
+
+        if (!videoId) {
+            throw new Error("Không tìm thấy videoId trong API Lecture.");
         }
+        
+        console.log("   Thành công lấy videoId bằng cách 2!");
+        return { videoId, duration }; // Trả về videoId từ cách 2 và duration từ cách 1.
+    } catch (fallbackError) {
+         console.error(`   Cách 2 cũng thất bại: ${fallbackError.message}`);
+         throw new Error("Không thể tìm thấy videoId bằng cả hai cách. Đây có thể là bài đọc thuần túy hoặc quiz.");
     }
 }
 
@@ -203,7 +183,9 @@ async function markLectureAsEnded(userId, courseSlug, lectureId) {
         if (response.ok) {
             console.log("   -> Yêu cầu bổ sung 'ended' thành công.");
         } else {
-            console.warn(`   -> Yêu cầu bổ sung 'ended' không thành công (Status: ${response.status}). Điều này có thể không ảnh hưởng đến kết quả cuối cùng.`);
+            const errorData = await response.json();
+            console.warn(`   -> Yêu cầu bổ sung 'ended' không thành công (Status: ${response.status}).`);
+            console.warn(`      Lý do: ${errorData.message}`);
         }
     } catch (error) {
         console.warn(`   -> Lỗi khi gửi yêu cầu 'ended': ${error.message}`);
@@ -215,7 +197,7 @@ async function markLectureAsEnded(userId, courseSlug, lectureId) {
 async function markCurrentVideoAsComplete() {
     try {
         console.clear();
-        console.log("%c🚀 BẮT ĐẦU SCRIPT HOÀN THÀNH VIDEO v5.1 🚀", "color: #8A2BE2; font-weight: bold; font-size: 16px");
+        console.log("%c🚀 BẮT ĐẦU SCRIPT HOÀN THÀNH VIDEO v5.3 🚀", "color: #8A2BE2; font-weight: bold; font-size: 16px");
 
         // 1. Lấy thông tin cơ bản
         const userId = getUserId();
@@ -231,7 +213,7 @@ async function markCurrentVideoAsComplete() {
 
         // 3. Lấy Video ID và Duration bằng phương pháp tổng hợp
         console.log("Đang lấy thông tin video...");
-        const { videoId, duration } = await getVideoInfo_V5(courseSlug, lectureId, courseId);
+        const { videoId, duration } = await getVideoInfo(courseSlug, lectureId, courseId);
         console.log(`- Video ID: ${videoId}`);
         console.log(`- Thời lượng (ms): ${duration}`);
 
@@ -240,7 +222,11 @@ async function markCurrentVideoAsComplete() {
         const success = await completeVideo(userId, courseId, videoId, duration);
 
         if (success) {
-            // 5. Gửi yêu cầu hoàn thành phụ (POST)
+            // 5. Đợi một chút để server đồng bộ
+            console.log("Đợi 2 giây để server đồng bộ tiến độ...");
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // 6. Gửi yêu cầu hoàn thành phụ (POST)
             console.log("Đang gửi yêu cầu hoàn thành bổ sung (POST)...");
             await markLectureAsEnded(userId, courseSlug, lectureId);
 
@@ -258,7 +244,7 @@ async function markCurrentVideoAsComplete() {
 
 // Hướng dẫn sử dụng
 console.log(`
-SCRIPT ĐÃ SẴN SÀNG! (v5.1 - Tích hợp Dual API Call)
+SCRIPT ĐÃ SẴN SÀNG! (v5.3 - Enhanced Logic & Delay)
 1. Đảm bảo bạn đang ở đúng trang bài giảng có video.
 2. Gõ lệnh sau vào console và nhấn Enter:
 `);
